@@ -1,0 +1,78 @@
+name: preview
+
+# Builds the public review copy of /digest/2026-10-28 in the run and deploys it to GitHub Pages.
+# No preview file is ever committed (ADR 0003). marker=with uses the LANE_MARKER secret;
+# marker=without saves the same page with LANE_MARKER unset, for the clean-up (plan § 4).
+on:
+  workflow_dispatch:
+    inputs:
+      marker:
+        description: "with = banner shows the lane marker; without = banner reads 'no marker set'"
+        type: choice
+        options: [with, without]
+        default: with
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install -g pnpm@12.18.0
+      - run: pnpm install --frozen-lockfile
+      - name: Save /digest/2026-10-28 as one HTML file
+        env:
+          LANE_MARKER: ${{ inputs.marker == 'with' && secrets.LANE_MARKER || '' }}
+          PORT: 8787
+        run: |
+          pnpm start > rig.log 2>&1 &
+          for i in $(seq 1 30); do curl -fsS http://localhost:8787/health >/dev/null 2>&1 && break; sleep 1; done
+          mkdir -p _site
+          curl -fsS http://localhost:8787/digest/2026-10-28 -o _site/index.html
+          if [ "${{ inputs.marker }}" = "with" ]; then
+            grep -q 'class="marker">no marker set' _site/index.html && { echo "marker missing"; exit 1; } || true
+          else
+            grep -q 'class="marker">no marker set' _site/index.html || { echo "marker still set"; exit 1; }
+          fi
+          wc -c _site/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+          retention-days: 1
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+  drop-artifact:
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete this run's artifacts, so the copy only lives behind the Pages link
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for id in $(gh api repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts --jq '.artifacts[].id'); do
+            gh api -X DELETE repos/${{ github.repository }}/actions/artifacts/$id
+          done
